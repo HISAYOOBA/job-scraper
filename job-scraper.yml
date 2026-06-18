@@ -1,20 +1,21 @@
-name: Weekly Job Scraper
+name: 世田谷区医院スクレイピング
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 1'   # 毎週月曜 09:00 JST（UTC 00:00）
-  workflow_dispatch:        # 手動実行ボタンも有効
+    - cron: "0 1 1 * *"
 
 permissions:
   contents: read
-  id-token: write           # Workload Identity 認証に必須
+  id-token: write
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: コードをチェックアウト
+      - name: チェックアウト
         uses: actions/checkout@v4
 
       - name: Google Cloud 認証（WIF）
@@ -26,12 +27,15 @@ jobs:
       - name: Python セットアップ
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: ライブラリインストール
-        run: pip install -r requirements.txt
+        run: pip install playwright beautifulsoup4 gspread google-auth
+
+      - name: Playwright ブラウザ取得
+        run: playwright install chromium --with-deps
 
       - name: スクレイピング実行
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-        run: python scraper.py
+        run: python scripts/scrape.py
