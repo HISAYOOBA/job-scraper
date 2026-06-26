@@ -1,206 +1,197 @@
+"""
+ハローワーク求人・求職情報提供サービス API を使い、東京23区のアルバイト求人データを
+取得してGoogleスプレッドシートに蓄積するスクリプト。
+
+GitHub Actions から毎週月曜9時に実行される想定。
+
+処理フロー:
+  1. トークン発行
+  2. 求人一覧データ取得（データID一覧の確認・東京都データの存在確認）
+  3. 指定求人データ取得（データID: M113＝民間職業紹介事業者用・一般求人・東京都、ページ送り）
+  4. 就業場所住所コードで東京23区のみ抽出
+  5. スプレッドシート上の既存 求人番号(kjno) と比較し、新規レコードのみ追加
+  6. トークン破棄
+
+データID M113 は「民間職業紹介事業者用」の東京都求人。
+利用団体の登録区分（民間職業紹介事業者）に対応するデータIDを使用すること。
+"""
+
 import os
-import time
+import sys
 import datetime
-import requests
-from bs4 import BeautifulSoup
+
 import gspread
 from google.auth import default
 
-# ── 認証（GitHub Actions WIF経由で自動取得） ──
-creds, _ = default(scopes=[
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-])
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(os.environ["SPREADSHEET_ID"])
+from hellowork_client import HelloWorkClient, HelloWorkAPIError
+from ward_codes import is_tokyo_23_ward, ward_name
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+# ── 設定 ──
+DATA_ID = "M113"  # 民間職業紹介事業者用・一般求人・東京都
+SHEET_NAME = "ハローワーク求人"
+
+# 就業場所住所コードは shgbsjusho1_c 〜 shgbsjusho4_c のいずれかに入る可能性があるため、
+# 優先順位を付けて先頭からチェックする
+ADDRESS_CODE_FIELDS = ["shgbsjusho1_c", "shgbsjusho2_c", "shgbsjusho3_c", "shgbsjusho4_c"]
+
+# スプレッドシートの列順（求人番号を先頭に置き、重複チェックのキーとして使う）
+SHEET_HEADERS = [
+    "取得日",
+    "求人番号(kjno)",
+    "受付年月日",
+    "区名",
+    "事業所名",
+    "事業所住所",
+    "就業場所住所",
+    "職種",
+    "仕事内容",
+    "雇用形態",
+    "賃金",
+    "基本給",
+    "選考担当者TEL",
+    "選考担当者FAX",
+    "選考担当者メール",
+]
+
 TODAY = datetime.date.today().strftime("%Y/%m/%d")
 
 
-# ════════════════════════════════════════
-# 1. マイナビバイト
-# ════════════════════════════════════════
-def scrape_mynavi(max_pages=3):
-    results = []
-    base_url = "https://baito.mynavi.jp/list/?ar=030&employmentStatus=2"
-    # ar=030: 東京23区, employmentStatus=2: アルバイト
-
-    for page in range(1, max_pages + 1):
-        url = f"{base_url}&page={page}"
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            cards = soup.select("div.cassetteRecruit")
-            if not cards:
-                break
-
-            for card in cards:
-                title_el   = card.select_one("h3.cassetteRecruit__name a")
-                company_el = card.select_one("p.cassetteRecruit__company")
-                area_el    = card.select_one("dd.cassetteRecruit__detail--place")
-                salary_el  = card.select_one("dd.cassetteRecruit__detail--wage")
-                employ_el  = card.select_one("span.cassetteRecruit__employmentStatus")
-                date_el    = card.select_one("span.cassetteRecruit__update")
-
-                title   = title_el.get_text(strip=True) if title_el else ""
-                url_job = "https://baito.mynavi.jp" + title_el["href"] if title_el else ""
-                company = company_el.get_text(strip=True) if company_el else ""
-                area    = area_el.get_text(strip=True) if area_el else ""
-                salary  = salary_el.get_text(strip=True) if salary_el else ""
-                employ  = employ_el.get_text(strip=True) if employ_el else "アルバイト"
-                pub     = date_el.get_text(strip=True) if date_el else TODAY
-
-                results.append([TODAY, "マイナビバイト", title, company, area, salary, employ, url_job, pub])
-
-            time.sleep(2)
-
-        except Exception as e:
-            print(f"[マイナビバイト] page={page} エラー: {e}")
-            break
-
-    print(f"[マイナビバイト] {len(results)}件取得")
-    return results
+def get_address_code(record: dict) -> str:
+    for field in ADDRESS_CODE_FIELDS:
+        code = record.get(field, "")
+        if code:
+            return code
+    return ""
 
 
-# ════════════════════════════════════════
-# 2. 求人ボックス
-# ════════════════════════════════════════
-def scrape_kyujinbox(max_pages=3):
-    results = []
-    base_url = "https://kyujinbox.com/jobs?keyword=アルバイト&location=東京都23区"
-
-    for page in range(1, max_pages + 1):
-        url = f"{base_url}&page={page}"
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            cards = soup.select("article.job-item")
-            if not cards:
-                break
-
-            for card in cards:
-                title_el   = card.select_one("h2.job-item__title a")
-                company_el = card.select_one("span.job-item__company")
-                area_el    = card.select_one("span.job-item__location")
-                salary_el  = card.select_one("span.job-item__salary")
-                employ_el  = card.select_one("span.job-item__employment-type")
-                date_el    = card.select_one("time")
-
-                title   = title_el.get_text(strip=True) if title_el else ""
-                url_job = title_el["href"] if title_el else ""
-                if url_job and not url_job.startswith("http"):
-                    url_job = "https://kyujinbox.com" + url_job
-                company = company_el.get_text(strip=True) if company_el else ""
-                area    = area_el.get_text(strip=True) if area_el else ""
-                salary  = salary_el.get_text(strip=True) if salary_el else ""
-                employ  = employ_el.get_text(strip=True) if employ_el else "アルバイト"
-                pub     = date_el["datetime"][:10].replace("-", "/") if date_el and date_el.get("datetime") else TODAY
-
-                results.append([TODAY, "求人ボックス", title, company, area, salary, employ, url_job, pub])
-
-            time.sleep(2)
-
-        except Exception as e:
-            print(f"[求人ボックス] page={page} エラー: {e}")
-            break
-
-    print(f"[求人ボックス] {len(results)}件取得")
-    return results
+def record_to_row(record: dict, ward: str) -> list:
+    """ハローワークAPIのレコード(dict)をスプレッドシートの行データに変換する"""
+    return [
+        TODAY,
+        record.get("kjno", ""),
+        record.get("uktkymd_seireki", ""),
+        ward,
+        record.get("jgshmei", ""),
+        record.get("jgshjusho", ""),
+        record.get("shgbsjusho", ""),
+        record.get("sksu", ""),
+        record.get("shigoto_ny", ""),
+        record.get("koyokeitai_n", ""),
+        record.get("chgn", ""),
+        record.get("khky", ""),
+        record.get("snktts_tel", ""),
+        record.get("snktts_fax", ""),
+        record.get("snktts_mail", ""),
+    ]
 
 
-# ════════════════════════════════════════
-# 3. エンゲージ
-# ════════════════════════════════════════
-def scrape_engage(max_pages=3):
-    results = []
-    base_url = "https://en-gage.net/user/search/?employmentStatus=4&prefCode=13&areaCode=1300"
-    # employmentStatus=4: アルバイト, prefCode=13: 東京都
-
-    for page in range(1, max_pages + 1):
-        url = f"{base_url}&page={page}"
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            cards = soup.select("li.job-list__item")
-            if not cards:
-                break
-
-            for card in cards:
-                title_el   = card.select_one("h2.job-list__item-title a")
-                company_el = card.select_one("p.job-list__item-company")
-                area_el    = card.select_one("span.job-list__item-location")
-                salary_el  = card.select_one("span.job-list__item-salary")
-                employ_el  = card.select_one("span.job-list__item-employment")
-                date_el    = card.select_one("time.job-list__item-date")
-
-                title   = title_el.get_text(strip=True) if title_el else ""
-                url_job = "https://en-gage.net" + title_el["href"] if title_el else ""
-                company = company_el.get_text(strip=True) if company_el else ""
-                area    = area_el.get_text(strip=True) if area_el else ""
-                salary  = salary_el.get_text(strip=True) if salary_el else ""
-                employ  = employ_el.get_text(strip=True) if employ_el else "アルバイト"
-                pub     = date_el.get_text(strip=True) if date_el else TODAY
-
-                results.append([TODAY, "エンゲージ", title, company, area, salary, employ, url_job, pub])
-
-            time.sleep(2)
-
-        except Exception as e:
-            print(f"[エンゲージ] page={page} エラー: {e}")
-            break
-
-    print(f"[エンゲージ] {len(results)}件取得")
-    return results
-
-
-# ════════════════════════════════════════
-# メイン処理
-# ════════════════════════════════════════
-def get_or_create_sheet(name):
-    """シート名で既存シートを取得、なければ新規作成"""
+def get_or_create_sheet(sh, name: str, headers: list):
     try:
-        return sh.worksheet(name)
+        ws = sh.worksheet(name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=5000, cols=10)
-        ws.append_row(["取得日", "媒体", "求人タイトル", "会社名", "勤務地", "給与", "雇用形態", "掲載URL", "掲載日"])
-        return ws
+        ws = sh.add_worksheet(title=name, rows=10000, cols=len(headers) + 2)
+        ws.append_row(headers)
+    return ws
+
+
+def fetch_existing_kjno_set(ws) -> set:
+    """
+    スプレッドシートに既に登録済みの求人番号(kjno)集合を取得する。
+    SHEET_HEADERS の "求人番号(kjno)" の列位置（B列＝2列目）を取得する。
+    """
+    col_index = SHEET_HEADERS.index("求人番号(kjno)") + 1  # gspreadは1始まり
+    values = ws.col_values(col_index)
+    # 先頭行はヘッダーなので除外
+    return set(v for v in values[1:] if v)
+
 
 def main():
-    all_results = []
-    all_results += scrape_mynavi(max_pages=3)
-    all_results += scrape_kyujinbox(max_pages=3)
-    all_results += scrape_engage(max_pages=3)
+    user_id = os.environ.get("HELLOWORK_USER_ID")
+    password = os.environ.get("HELLOWORK_PASSWORD")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
 
-    if not all_results:
-        print("取得件数0件。終了します。")
-        return
+    if not user_id or not password:
+        print("エラー: HELLOWORK_USER_ID / HELLOWORK_PASSWORD が設定されていません。", file=sys.stderr)
+        sys.exit(1)
+    if not spreadsheet_id:
+        print("エラー: SPREADSHEET_ID が設定されていません。", file=sys.stderr)
+        sys.exit(1)
 
-    # 媒体ごとに別シートに書き込み
-    from itertools import groupby
-    all_results.sort(key=lambda x: x[1])  # 媒体名でソート
-    for media, rows in groupby(all_results, key=lambda x: x[1]):
-        ws = get_or_create_sheet(media)
-        ws.append_rows(list(rows))
-        print(f"[{media}] スプレッドシートに書き込み完了")
+    # ── Googleスプレッドシート認証（GitHub Actions WIF経由） ──
+    creds, _ = default(scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = get_or_create_sheet(sh, SHEET_NAME, SHEET_HEADERS)
 
-    # 全件まとめシートにも追記
-    ws_all = get_or_create_sheet("全媒体")
-    ws_all.append_rows(all_results)
+    existing_kjno = fetch_existing_kjno_set(ws)
+    print(f"既存の求人番号: {len(existing_kjno)}件")
 
-    print(f"\n✅ 合計 {len(all_results)}件 書き込み完了")
+    # ── ハローワークAPI呼び出し ──
+    client = HelloWorkClient(user_id, password)
+
+    try:
+        client.get_token()
+        print("トークン発行に成功しました。")
+
+        # データID一覧を確認し、対象データIDが存在するか検証する
+        data_ids = client.list_data_ids()
+        target = next((d for d in data_ids if d["data_id"] == DATA_ID), None)
+        if target is None:
+            print(f"エラー: データID {DATA_ID} が一覧に見つかりませんでした。"
+                  f" 利用団体の登録区分（民間職業紹介事業者）を確認してください。", file=sys.stderr)
+            sys.exit(1)
+        print(f"対象データ: {target['data_name']}（全{target['count']}件、{target['page']}ページ）")
+
+        BATCH_SIZE = 200  # この件数ごとにスプレッドシートへ書き込み、途中失敗時のデータ消失を防ぐ
+        pending_rows = []
+        total_fetched = 0
+        total_23ward = 0
+        total_added = 0
+
+        def flush_pending():
+            nonlocal pending_rows, total_added
+            if pending_rows:
+                ws.append_rows(pending_rows, value_input_option="USER_ENTERED")
+                total_added += len(pending_rows)
+                print(f"  → {len(pending_rows)}件をスプレッドシートに書き込みました（累計{total_added}件）")
+                pending_rows = []
+
+        for record in client.iter_all_kyujin(DATA_ID):
+            total_fetched += 1
+            kjno = record.get("kjno", "")
+
+            address_code = get_address_code(record)
+            ward = ward_name(address_code)
+            if not is_tokyo_23_ward(address_code):
+                continue
+            total_23ward += 1
+
+            if kjno in existing_kjno:
+                continue  # 既にスプレッドシートに登録済み
+
+            pending_rows.append(record_to_row(record, ward))
+            existing_kjno.add(kjno)  # 同一実行内での重複も防ぐ
+
+            if len(pending_rows) >= BATCH_SIZE:
+                flush_pending()
+
+        flush_pending()  # 残りを書き込み
+
+        print(f"取得件数: {total_fetched}件 / 23区該当: {total_23ward}件 / 新規追加: {total_added}件")
+
+        if total_added == 0:
+            print("新規追加データはありませんでした。")
+
+    except HelloWorkAPIError as e:
+        print(f"ハローワークAPIエラー: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        client.del_token()
+        print("トークンを破棄しました。")
+
 
 if __name__ == "__main__":
     main()
