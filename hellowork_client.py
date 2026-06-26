@@ -107,11 +107,15 @@ class HelloWorkClient:
     # ────────────────────────────────
     # 指定求人データ取得処理 (2.6)
     # ────────────────────────────────
-    def get_kyujin_page(self, data_id: str, page: int = 1) -> tuple[list[dict], int]:
+    def get_kyujin_page(self, data_id: str, page: int = 1) -> list[dict]:
         """
         指定データID・ページの求人情報データを取得する。
 
-        戻り値: (求人レコードのリスト, 総ページ数)
+        注意: レスポンスの <page> タグは「取得したページ番号」であり、
+        「総ページ数」ではない（仕様書 2.6 (6) 項目一覧 No.7 参照）。
+        総ページ数を知るには list_data_ids() の戻り値（各データIDの "page" ＝ 総ページ数）を使うこと。
+
+        戻り値: 求人レコードのリスト
         """
         if not self.token:
             raise HelloWorkAPIError("トークンが未発行です。先に get_token() を呼んでください。")
@@ -126,30 +130,28 @@ class HelloWorkClient:
             )
 
         root = ET.fromstring(res.content)
-        total_pages = int(_text(root, "page") or 1)
 
         records = []
         for data_el in root.findall(".//kyujin/data"):
             record = {child.tag: (child.text or "") for child in data_el}
             records.append(record)
 
-        return records, total_pages
+        return records
 
-    def iter_all_kyujin(self, data_id: str) -> Iterator[dict]:
+    def iter_all_kyujin(self, data_id: str, total_pages: int) -> Iterator[dict]:
         """
-        指定データIDの全ページを順に取得し、求人レコードを1件ずつ返すジェネレータ。
+        指定データIDの全ページ（1〜total_pages）を順に取得し、求人レコードを1件ずつ返すジェネレータ。
+
+        total_pages は list_data_ids() で事前に取得した「総ページ数」を渡すこと。
         ページ間でサーバー負荷軽減のためスリープを挟む。
         """
-        page = 1
-        while True:
-            records, total_pages = self.get_kyujin_page(data_id, page)
+        for page in range(1, total_pages + 1):
+            records = self.get_kyujin_page(data_id, page)
             for record in records:
                 yield record
 
-            if page >= total_pages:
-                break
-            page += 1
-            time.sleep(REQUEST_INTERVAL_SEC)
+            if page < total_pages:
+                time.sleep(REQUEST_INTERVAL_SEC)
 
 
 def _text(parent: ET.Element, tag: str) -> str:
