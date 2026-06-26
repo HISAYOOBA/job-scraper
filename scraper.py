@@ -159,7 +159,7 @@ def main():
                 print(f"  → {len(pending_rows)}件をスプレッドシートに書き込みました（累計{total_added}件）")
                 pending_rows = []
 
-        for record in client.iter_all_kyujin(DATA_ID):
+        for record in client.iter_all_kyujin(DATA_ID, total_pages=target["page"]):
             total_fetched += 1
             kjno = record.get("kjno", "")
 
