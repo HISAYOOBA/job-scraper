@@ -34,4 +34,6 @@ jobs:
       - name: スクレイピング実行
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          HELLOWORK_USER_ID: ${{ secrets.HELLOWORK_USER_ID }}
+          HELLOWORK_PASSWORD: ${{ secrets.HELLOWORK_PASSWORD }}
         run: python scraper.py
